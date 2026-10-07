@@ -1,9 +1,10 @@
 import { Attendance } from '../models/Attendance.js';
 import { Employee } from '../models/Employee.js';
 import { LeaveRequest } from '../models/LeaveRequest.js';
+import { Holiday } from '../models/Holiday.js';
 import { ROLES } from '../constants/roles.js';
 import { env } from '../config/env.js';
-import { dateKeyInTimeZone } from '../utils/date.js';
+import { dateKeyInTimeZone, shiftDateKey, startOfDateKey } from '../utils/date.js';
 
 export async function getSummary(req, res) {
   const now = new Date();
@@ -13,15 +14,26 @@ export async function getSummary(req, res) {
     : null;
   const teamIds = team?.map(({ _id }) => _id) ?? null;
   const employeeFilter = { employmentStatus: 'active', ...(teamIds ? { _id: { $in: teamIds } } : {}) };
-  const employeeTotal = await Employee.countDocuments(employeeFilter);
+  const weekday = new Date(`${today}T12:00:00.000Z`).getUTCDay();
+  const employeeStats = await Employee.aggregate([
+    { $match: employeeFilter },
+    { $lookup: { from: 'shifts', localField: 'shift', foreignField: '_id', as: 'shiftConfig' } },
+    { $unwind: { path: '$shiftConfig', preserveNullAndEmptyArrays: true } },
+    { $group: { _id: null, employeeTotal: { $sum: 1 }, scheduledToday: { $sum: { $cond: [{ $in: [weekday, { $ifNull: ['$shiftConfig.weeklyOffDays', [0, 6]] }] }, 0, 1] } } } },
+  ]);
+  const employeeTotal = employeeStats[0]?.employeeTotal ?? 0;
+  const scheduledToday = employeeStats[0]?.scheduledToday ?? 0;
   const attendanceFilter = { dateKey: today, ...(teamIds ? { employee: { $in: teamIds } } : {}) };
-  const [todayRows, pendingLeaves] = await Promise.all([
+  const [todayRows, pendingLeaves, companyHoliday] = await Promise.all([
     Attendance.find(attendanceFilter).populate('employee', 'employeeId firstName lastName department').populate('office', 'name').sort({ updatedAt: -1 }).limit(12),
     LeaveRequest.countDocuments({ status: 'pending', ...(teamIds ? { employee: { $in: teamIds } } : {}) }),
+    Holiday.exists({ date: today, active: true, category: { $in: ['company', 'national', 'festival'] } }),
   ]);
   const presentToday = await Attendance.countDocuments({ ...attendanceFilter, 'events.type': 'IN' });
   const lateToday = await Attendance.countDocuments({ ...attendanceFilter, status: 'late' });
-  const onLeave = await LeaveRequest.countDocuments({ status: 'approved', startDate: { $lte: now }, endDate: { $gte: now }, ...(teamIds ? { employee: { $in: teamIds } } : {}) });
+  const dayStart = startOfDateKey(today);
+  const nextDayStart = startOfDateKey(shiftDateKey(today, 1));
+  const onLeave = await LeaveRequest.countDocuments({ status: 'approved', startDate: { $lt: nextDayStart }, endDate: { $gte: dayStart }, ...(teamIds ? { employee: { $in: teamIds } } : {}) });
 
   const days = Array.from({ length: 7 }, (_, i) => {
     const day = new Date(now);
@@ -52,7 +64,7 @@ export async function getSummary(req, res) {
 
   res.json({ success: true, message: 'Dashboard summary', data: {
     date: today,
-    metrics: { employeeTotal, presentToday, lateToday, absentToday: Math.max(0, employeeTotal - presentToday - onLeave), onLeave, pendingLeaves },
+    metrics: { employeeTotal, presentToday, lateToday, absentToday: companyHoliday ? 0 : Math.max(0, scheduledToday - presentToday - onLeave), onLeave, pendingLeaves },
     trend: days.map((date) => ({ date, present: trendMap.get(date)?.present ?? 0, late: trendMap.get(date)?.late ?? 0 })),
     recentAttendance: recent,
   } });

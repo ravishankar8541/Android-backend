@@ -12,3 +12,9 @@ export function dateKeyInTimeZone(date, timeZone) {
 export function startOfDateKey(dateKey) {
   return new Date(`${dateKey}T00:00:00.000Z`);
 }
+
+export function shiftDateKey(dateKey, dayOffset) {
+  const date = new Date(`${dateKey}T12:00:00.000Z`);
+  date.setUTCDate(date.getUTCDate() + dayOffset);
+  return date.toISOString().slice(0, 10);
+}

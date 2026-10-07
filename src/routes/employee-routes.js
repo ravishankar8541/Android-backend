@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import { z } from 'zod';
-import { createEmployee, getEmployee, listEmployees, updateEmployee } from '../controllers/employee-controller.js';
+import { createEmployee, getEmployee, listEmployees, resetEmployeePassword, updateEmployee } from '../controllers/employee-controller.js';
 import { allowRoles, requireAuth } from '../middleware/auth.js';
 import { ADMIN_ROLES, MANAGER_ROLES } from '../constants/roles.js';
 import { validate } from '../middleware/validate.js';
@@ -33,11 +33,13 @@ const updateSchema = z.object({
   employmentStatus: z.enum(['active', 'inactive']).optional(),
   faceEnrollmentStatus: z.enum(['not_enrolled', 'pending', 'enrolled', 'disabled']).optional(),
 }).refine((body) => Object.keys(body).length > 0, 'Provide at least one field to update');
+const resetPasswordSchema = z.object({ temporaryPassword: z.string().min(12).max(200) });
 
 router.use(requireAuth);
 router.get('/', allowRoles(...MANAGER_ROLES), asyncHandler(listEmployees));
 router.post('/', allowRoles(...ADMIN_ROLES), validate(createSchema), asyncHandler(createEmployee));
 router.get('/:id', allowRoles(...MANAGER_ROLES), asyncHandler(getEmployee));
 router.patch('/:id', allowRoles(...ADMIN_ROLES), validate(updateSchema), asyncHandler(updateEmployee));
+router.post('/:id/reset-password', allowRoles(...ADMIN_ROLES), validate(resetPasswordSchema), asyncHandler(resetEmployeePassword));
 
 export default router;

@@ -2,6 +2,8 @@ import { Employee } from '../models/Employee.js';
 import { User } from '../models/User.js';
 import { AuditLog } from '../models/AuditLog.js';
 import { HttpError } from '../utils/http-error.js';
+import { FaceTemplate } from '../models/FaceTemplate.js';
+import { BiometricSession } from '../models/BiometricSession.js';
 
 function pagination(query) {
   const page = Math.max(1, Number(query.page) || 1);
@@ -14,7 +16,7 @@ export async function listEmployees(req, res) {
   const filter = {};
   if (req.auth.role === 'manager') {
     const team = req.auth.employeeId ? await Employee.find({ manager: req.auth.employeeId }).select('_id') : [];
-    filter._id = { $in: team.map(({ id }) => id) };
+    filter._id = { $in: team.map(({ _id }) => _id) };
   }
   if (req.query.status && req.query.status !== 'all') filter.employmentStatus = req.query.status;
   if (req.query.department) filter.department = req.query.department;
@@ -60,8 +62,27 @@ export async function updateEmployee(req, res) {
   const allowed = ['firstName', 'lastName', 'phone', 'department', 'designation', 'manager', 'office', 'shift', 'employmentStatus', 'faceEnrollmentStatus'];
   for (const key of allowed) if (req.body[key] !== undefined) employee[key] = req.body[key];
   await employee.save();
+  if (req.body.faceEnrollmentStatus === 'disabled') {
+    await FaceTemplate.deleteOne({ employee: employee.id });
+    await BiometricSession.deleteMany({ employee: employee.id, usedAt: null });
+  }
+  if (req.body.employmentStatus !== undefined) {
+    await User.updateOne({ employee: employee.id }, { $set: { active: employee.employmentStatus === 'active' } });
+  }
   await AuditLog.create({ actor: req.auth.userId, action: 'employee.updated', entityType: 'Employee', entityId: employee.id, ipAddress: req.ip });
   res.json({ success: true, message: 'Employee updated', data: { employee } });
+}
+
+export async function resetEmployeePassword(req, res) {
+  const employee = await Employee.findById(req.params.id).select('_id email');
+  if (!employee) throw new HttpError(404, 'Employee not found', 'EMPLOYEE_NOT_FOUND');
+  const user = await User.findOne({ employee: employee.id }).select('+passwordHash +refreshTokenHash');
+  if (!user) throw new HttpError(404, 'Employee sign-in account not found', 'EMPLOYEE_ACCOUNT_NOT_FOUND');
+  await user.setPassword(req.body.temporaryPassword);
+  user.refreshTokenHash = null;
+  await user.save({ validateBeforeSave: false });
+  await AuditLog.create({ actor: req.auth.userId, action: 'employee.password_reset', entityType: 'Employee', entityId: employee.id, ipAddress: req.ip });
+  res.json({ success: true, message: 'Employee password reset; active refresh sessions were revoked', data: null });
 }
 
 export async function getEmployee(req, res) {

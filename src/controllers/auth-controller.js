@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
 import jwt from 'jsonwebtoken';
 import { User } from '../models/User.js';
+import { Employee } from '../models/Employee.js';
 import { HttpError } from '../utils/http-error.js';
 import { env } from '../config/env.js';
 
@@ -35,18 +36,25 @@ async function rotateRefreshToken(user, res) {
   user.refreshTokenHash = sha256(refreshToken);
   await user.save({ validateBeforeSave: false });
   setRefreshCookie(res, refreshToken);
-  return createAccessToken(user);
+  return { accessToken: createAccessToken(user), refreshToken };
 }
 
 export async function login(req, res) {
-  const email = req.body.email.toLowerCase();
+  const identifier = (req.body.identifier || req.body.email).trim().toLowerCase();
+  let email = identifier;
+  if (!identifier.includes('@')) {
+    const employee = await Employee.findOne({ employeeId: identifier.toUpperCase() }).select('email');
+    if (!employee) throw new HttpError(401, 'Email/employee ID or password is incorrect', 'INVALID_CREDENTIALS');
+    email = employee.email;
+  }
   const user = await User.findOne({ email }).select('+passwordHash +refreshTokenHash');
   if (!user || !(await user.verifyPassword(req.body.password))) throw new HttpError(401, 'Email or password is incorrect', 'INVALID_CREDENTIALS');
   if (!user.active) throw new HttpError(403, 'This account is inactive', 'ACCOUNT_INACTIVE');
-  const accessToken = await rotateRefreshToken(user, res);
+  const { accessToken, refreshToken } = await rotateRefreshToken(user, res);
   const employeeProfile = user.employee ? (await user.populate('employee')).employee : null;
   res.json({ success: true, message: 'Signed in successfully', data: {
     accessToken,
+    ...(req.get('x-client-platform') === 'native' ? { refreshToken } : {}),
     user: { id: user.id, email: user.email, role: user.role, employee: employeeProfile ? {
       id: employeeProfile.id,
       employeeId: employeeProfile.employeeId,
@@ -57,7 +65,8 @@ export async function login(req, res) {
 }
 
 export async function refresh(req, res) {
-  const token = req.cookies?.[COOKIE_NAME];
+  const isNative = req.get('x-client-platform') === 'native';
+  const token = isNative ? req.body?.refreshToken : req.cookies?.[COOKIE_NAME];
   if (!token) throw new HttpError(401, 'Sign in to continue', 'REFRESH_TOKEN_MISSING');
   const hash = sha256(token);
   const user = await User.findOne({ refreshTokenHash: hash }).select('+refreshTokenHash');
@@ -65,19 +74,36 @@ export async function refresh(req, res) {
     clearRefreshCookie(res);
     throw new HttpError(401, 'Your session has expired. Sign in again.', 'INVALID_REFRESH_TOKEN');
   }
-  const accessToken = await rotateRefreshToken(user, res);
-  res.json({ success: true, message: 'Session refreshed', data: { accessToken } });
+  const { accessToken, refreshToken } = await rotateRefreshToken(user, res);
+  res.json({ success: true, message: 'Session refreshed', data: { accessToken, ...(isNative ? { refreshToken } : {}) } });
 }
 
 export async function logout(req, res) {
-  const token = req.cookies?.[COOKIE_NAME];
+  const token = req.get('x-client-platform') === 'native' ? req.body?.refreshToken : req.cookies?.[COOKIE_NAME];
   if (token) await User.updateOne({ refreshTokenHash: sha256(token) }, { $set: { refreshTokenHash: null } });
   clearRefreshCookie(res);
   res.json({ success: true, message: 'Signed out successfully', data: null });
 }
 
+export async function changePassword(req, res) {
+  const user = await User.findById(req.auth.userId).select('+passwordHash +refreshTokenHash');
+  if (!user || !(await user.verifyPassword(req.body.currentPassword))) {
+    throw new HttpError(401, 'Your current password is incorrect', 'CURRENT_PASSWORD_INCORRECT');
+  }
+  await user.setPassword(req.body.newPassword);
+  const { accessToken, refreshToken } = await rotateRefreshToken(user, res);
+  res.json({ success: true, message: 'Password updated', data: { accessToken, ...(req.get('x-client-platform') === 'native' ? { refreshToken } : {}) } });
+}
+
 export async function getCurrentUser(req, res) {
-  const user = await User.findById(req.auth.userId).populate('employee');
+  const user = await User.findById(req.auth.userId).populate({
+    path: 'employee',
+    populate: [
+      { path: 'office', select: 'name address latitude longitude radiusMeters active' },
+      { path: 'shift', select: 'name startTime endTime graceMinutes breakMinutes active' },
+      { path: 'manager', select: 'firstName lastName employeeId' },
+    ],
+  });
   res.json({ success: true, message: 'Current user', data: { user: {
     id: user.id,
     email: user.email,
@@ -88,6 +114,14 @@ export async function getCurrentUser(req, res) {
       firstName: user.employee.firstName,
       lastName: user.employee.lastName,
       department: user.employee.department,
+      designation: user.employee.designation,
+      phone: user.employee.phone,
+      joiningDate: user.employee.joiningDate,
+      employmentStatus: user.employee.employmentStatus,
+      faceEnrollmentStatus: user.employee.faceEnrollmentStatus,
+      office: user.employee.office,
+      shift: user.employee.shift,
+      manager: user.employee.manager,
     } : null,
   } } });
 }

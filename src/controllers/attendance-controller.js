@@ -3,10 +3,11 @@ import { Attendance } from '../models/Attendance.js';
 import { Employee } from '../models/Employee.js';
 import { AuditLog } from '../models/AuditLog.js';
 import { HttpError } from '../utils/http-error.js';
-import { dateKeyInTimeZone } from '../utils/date.js';
+import { dateKeyInTimeZone, shiftDateKey } from '../utils/date.js';
 import { env } from '../config/env.js';
 import { ROLES } from '../constants/roles.js';
 import { markAttendance } from '../services/attendance-service.js';
+import { assertAlternatingAttendanceEvent, calculateNetWorkingMinutes } from '../services/attendance-rules.js';
 
 export const attendanceEventSchema = z.object({
   verificationSessionId: z.string().min(1),
@@ -29,31 +30,57 @@ export async function checkOut(req, res) {
 export async function getToday(req, res) {
   if (!req.auth.employeeId) throw new HttpError(403, 'Employee profile required', 'EMPLOYEE_PROFILE_REQUIRED');
   const dateKey = dateKeyInTimeZone(new Date(), env.OFFICE_TIME_ZONE);
-  const attendance = await Attendance.findOne({ employee: req.auth.employeeId, dateKey }).select('-events.verification.providerReference');
+  let attendance = await Attendance.findOne({ employee: req.auth.employeeId, dateKey });
+  if (!attendance) {
+    const employee = await Employee.findById(req.auth.employeeId).populate('shift', 'startTime endTime');
+    if (employee?.shift) {
+      const [startHour, startMinute] = employee.shift.startTime.split(':').map(Number);
+      const [endHour, endMinute] = employee.shift.endTime.split(':').map(Number);
+      const endOfOvernightShift = endHour * 60 + endMinute;
+      const now = new Intl.DateTimeFormat('en-GB', { timeZone: env.OFFICE_TIME_ZONE, hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }).format(new Date()).split(':').map(Number);
+      const currentMinute = now[0] * 60 + now[1];
+      if (endOfOvernightShift <= startHour * 60 + startMinute && currentMinute <= endOfOvernightShift + 240) {
+        const previous = await Attendance.findOne({ employee: req.auth.employeeId, dateKey: shiftDateKey(dateKey, -1) });
+        if (previous?.events.at(-1)?.type === 'IN') attendance = previous;
+      }
+    }
+  }
   res.json({ success: true, message: 'Today\'s attendance', data: { attendance } });
 }
 
 export async function listAttendance(req, res) {
-  const page = Math.max(1, Number(req.query.page) || 1);
-  const limit = Math.min(100, Math.max(1, Number(req.query.limit) || 20));
+  const query = req.validatedQuery ?? req.query;
+  const page = Math.max(1, Number(query.page) || 1);
+  const limit = Math.min(100, Math.max(1, Number(query.limit) || 20));
   const filter = {};
-  if (req.query.date) filter.dateKey = req.query.date;
-  if (req.query.status && req.query.status !== 'all') filter.status = req.query.status;
-  if (req.query.office) filter.office = req.query.office;
+  if (query.date) filter.dateKey = query.date;
+  if (query.status && query.status !== 'all') filter.status = query.status;
+  if (query.office) filter.office = query.office;
   let allowedEmployeeIds = null;
-  if (req.query.employee) {
-    const escaped = req.query.employee.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const narrowEmployeeIds = (ids) => {
+    const values = ids.map((id) => id.toString());
+    allowedEmployeeIds = allowedEmployeeIds === null ? values : allowedEmployeeIds.filter((id) => values.includes(id));
+  };
+  if (query.employee) {
+    const escaped = query.employee.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     const matches = await Employee.find({ employeeId: { $regex: escaped, $options: 'i' } }).select('_id');
-    allowedEmployeeIds = matches.map(({ _id }) => _id.toString());
+    narrowEmployeeIds(matches.map(({ _id }) => _id));
+  }
+  const employeeFilter = {};
+  if (query.department) employeeFilter.department = query.department;
+  if (query.shift) employeeFilter.shift = query.shift;
+  if (Object.keys(employeeFilter).length) {
+    const matches = await Employee.find(employeeFilter).select('_id');
+    narrowEmployeeIds(matches.map(({ _id }) => _id));
   }
   if (req.auth.role === ROLES.MANAGER) {
     const team = req.auth.employeeId ? await Employee.find({ manager: req.auth.employeeId }).select('_id') : [];
     const teamIds = [...team.map(({ _id }) => _id.toString()), ...(req.auth.employeeId ? [req.auth.employeeId] : [])];
-    allowedEmployeeIds = allowedEmployeeIds === null ? teamIds : allowedEmployeeIds.filter((id) => teamIds.includes(id));
+    narrowEmployeeIds(teamIds);
   }
   if (allowedEmployeeIds !== null) filter.employee = { $in: allowedEmployeeIds };
-  if (req.query.from || req.query.to) {
-    filter.dateKey = { ...(req.query.from ? { $gte: req.query.from } : {}), ...(req.query.to ? { $lte: req.query.to } : {}) };
+  if (query.from || query.to) {
+    filter.dateKey = { ...(query.from ? { $gte: query.from } : {}), ...(query.to ? { $lte: query.to } : {}) };
   }
   const [items, total] = await Promise.all([
     Attendance.find(filter).select('-events.verification.providerReference').populate('employee', 'employeeId firstName lastName department').populate('office', 'name').sort({ dateKey: -1, updatedAt: -1 }).skip((page - 1) * limit).limit(limit),
@@ -82,7 +109,12 @@ export const correctionSchema = z.object({
 export async function correctAttendance(req, res) {
   const attendance = await Attendance.findById(req.params.id);
   if (!attendance) throw new HttpError(404, 'Attendance record not found', 'ATTENDANCE_NOT_FOUND');
-  const employee = await Employee.findById(attendance.employee).populate('office');
+  const employee = await Employee.findById(attendance.employee).populate('office').populate('shift');
+  if (!employee) throw new HttpError(404, 'Employee profile not found', 'EMPLOYEE_NOT_FOUND');
+  if (req.body.occurredAt > new Date() || dateKeyInTimeZone(req.body.occurredAt, env.OFFICE_TIME_ZONE) !== attendance.dateKey) {
+    throw new HttpError(422, 'Correction time must be on the attendance date and cannot be in the future', 'INVALID_CORRECTION_TIME');
+  }
+  assertAlternatingAttendanceEvent(attendance.events, req.body.type, req.body.occurredAt);
   attendance.events.push({
     type: req.body.type,
     occurredAt: req.body.occurredAt,
@@ -98,6 +130,7 @@ export async function correctAttendance(req, res) {
     correctionReason: req.body.reason,
   });
   attendance.events.sort((a, b) => a.occurredAt - b.occurredAt);
+  attendance.netWorkingMinutes = calculateNetWorkingMinutes(attendance.events, employee.shift?.breakMinutes ?? 0);
   attendance.status = 'manual_review';
   await attendance.save();
   await AuditLog.create({ actor: req.auth.userId, action: 'attendance.corrected', entityType: 'Attendance', entityId: attendance.id, reason: req.body.reason, ipAddress: req.ip });
